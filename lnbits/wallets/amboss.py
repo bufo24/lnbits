@@ -156,7 +156,7 @@ query($id: String!, $password_hash: String) {
 _FIND_BY_PAYMENT_HASH = f"""
 query($hash: String!) {{
   payment {{
-    transaction {{ find_by_payment_hash(payment_hash: $hash) {{ {_TX_FIELDS} }} }}
+    transaction {{ find_one(payment_hash: $hash) {{ {_TX_FIELDS} }} }}
   }}
 }}"""
 
@@ -405,8 +405,9 @@ class AmbossWallet(Wallet):
         try:
             tx = (await self._gql(_FIND_BY_PAYMENT_HASH, {"hash": checking_id}))[
                 "payment"
-            ]["transaction"]["find_by_payment_hash"]
+            ]["transaction"]["find_one"]
         except Exception as exc:
+            # find_one throws "not found" until the send tx is visible — pending.
             logger.warning(f"AmbossWallet payment status error: {exc}")
             return PaymentPendingStatus()
         return self._map_tx_status(tx)
