@@ -135,7 +135,10 @@ query($id: String!) {
 
 _GET_SEND_CONTEXT = """
 query($id: String!) {
-  payment { wallet { find_one(id: $id) { id team_id environment { type } } } }
+  payment {
+    id
+    wallet { find_one(id: $id) { id environment { type } } }
+  }
 }"""
 
 _GET_NODE_PERMISSIONS = """
@@ -149,6 +152,13 @@ query($id: String!, $password_hash: String) {
     }
   } } }
 }"""
+
+_FIND_BY_PAYMENT_HASH = f"""
+query($hash: String!) {{
+  payment {{
+    transaction {{ find_by_payment_hash(payment_hash: $hash) {{ {_TX_FIELDS} }} }}
+  }}
+}}"""
 
 
 class AmbossWallet(Wallet):
@@ -166,6 +176,10 @@ class AmbossWallet(Wallet):
         self.wallet_id = settings.amboss_wallet_id
         self.team_password = settings.amboss_team_password
         self.endpoint = settings.amboss_api_endpoint
+        # Static per wallet: (team_id, is_sandbox, node, macaroon_hex). Cached so
+        # repeat sends skip the ~3s GetSendContext + Argon2 + node-permissions
+        # decrypt. ponytail: reset requires a restart if the node/macaroon rotates.
+        self._send_cache: tuple[str, bool, dict | None, str | None] | None = None
 
         self.client = httpx.AsyncClient(
             base_url=self.endpoint,
@@ -186,10 +200,17 @@ class AmbossWallet(Wallet):
         r = await self.client.post(
             "", json={"query": query, "variables": variables}, timeout=40
         )
-        r.raise_for_status()
-        body = r.json()
+        # GraphQL errors (including schema-validation failures) come back as a
+        # JSON `errors` array even on HTTP 400 — surface that before falling
+        # back to raise_for_status, otherwise the real reason is lost.
+        try:
+            body = r.json()
+        except ValueError:
+            r.raise_for_status()
+            raise
         if body.get("errors"):
             raise ValueError(str(body["errors"][0].get("message", body["errors"])))
+        r.raise_for_status()
         return body["data"]
 
     async def status(self) -> StatusResponse:
@@ -235,21 +256,7 @@ class AmbossWallet(Wallet):
 
     async def pay_invoice(self, bolt11: str, fee_limit_msat: int) -> PaymentResponse:
         try:
-            ctx = (await self._gql(_GET_SEND_CONTEXT, {"id": self.wallet_id}))[
-                "payment"
-            ]["wallet"]["find_one"]
-
-            is_sandbox = ctx["environment"]["type"] == "SANDBOX"
-            node = None
-            macaroon_hex = None
-
-            if not is_sandbox:
-                if not self.team_password:
-                    return PaymentResponse(
-                        error_message="amboss_team_password required to send"
-                    )
-                node, macaroon_hex = await self._resolve_node(ctx["team_id"])
-
+            _team_id, is_sandbox, node, macaroon_hex = await self._send_context()
             tx = (
                 await self._gql(
                     _CREATE_SEND,
@@ -262,10 +269,13 @@ class AmbossWallet(Wallet):
                 )
             )["payment"]["transaction"]["create_send"]
         except Exception as exc:
-            logger.warning(f"AmbossWallet create_send error: {exc}")
+            logger.warning(f"AmbossWallet send error: {exc}")
             return PaymentResponse(error_message=str(exc))
 
-        checking_id = tx["id"]
+        # lnbits keys outgoing payments by the bolt11 payment_hash and fails the
+        # payment unless pay_invoice returns the same checking_id, so use the
+        # hash create_send recorded (equals the bolt11 hash), not the tx id.
+        checking_id = (tx.get("payment_hash") or "").lower()
         if is_sandbox:
             # No node to pay; backend settles asynchronously — poll the ledger.
             return PaymentResponse(ok=None, checking_id=checking_id)
@@ -275,6 +285,29 @@ class AmbossWallet(Wallet):
         return await self._pay_via_node(
             node, macaroon_hex, payment_request, fee_limit_msat, checking_id
         )
+
+    async def _send_context(self) -> tuple[str, bool, dict | None, str | None]:
+        """Resolve (and cache) the static send context for this wallet: the team
+        id (Argon2 salt), sandbox flag, and — for live wallets — the LND node and
+        its decrypted admin macaroon."""
+        if self._send_cache is not None:
+            return self._send_cache
+
+        payment = (await self._gql(_GET_SEND_CONTEXT, {"id": self.wallet_id}))[
+            "payment"
+        ]
+        # payment.id is the team id — the Argon2 salt for macaroon decryption.
+        team_id = payment["id"]
+        is_sandbox = payment["wallet"]["find_one"]["environment"]["type"] == "SANDBOX"
+
+        node = macaroon_hex = None
+        if not is_sandbox:
+            if not self.team_password:
+                raise ValueError("amboss_team_password required to send")
+            node, macaroon_hex = await self._resolve_node(team_id)
+
+        self._send_cache = (team_id, is_sandbox, node, macaroon_hex)
+        return self._send_cache
 
     async def _resolve_node(self, team_id: str) -> tuple[dict, str]:
         master_key, master_password_hash = create_master_password_hash(
@@ -356,20 +389,31 @@ class AmbossWallet(Wallet):
         return PaymentResponse(ok=None, checking_id=checking_id)
 
     async def get_invoice_status(self, checking_id: str) -> PaymentStatus:
-        return await self._ledger_status(checking_id)
-
-    async def get_payment_status(self, checking_id: str) -> PaymentStatus:
-        return await self._ledger_status(checking_id)
-
-    async def _ledger_status(self, checking_id: str) -> PaymentStatus:
+        # Invoice checking_id is the Amboss transaction id (UUID).
         try:
             tx = (await self._gql(_GET_TRANSACTION, {"id": checking_id}))["payment"][
                 "transaction"
             ]["find_one"]
         except Exception as exc:
-            logger.warning(f"AmbossWallet status error: {exc}")
+            logger.warning(f"AmbossWallet invoice status error: {exc}")
             return PaymentPendingStatus()
+        return self._map_tx_status(tx)
 
+    async def get_payment_status(self, checking_id: str) -> PaymentStatus:
+        # Payment checking_id is the bolt11 payment_hash — look it up in the
+        # ledger by hash (never via the node, which is used only for paying).
+        try:
+            tx = (await self._gql(_FIND_BY_PAYMENT_HASH, {"hash": checking_id}))[
+                "payment"
+            ]["transaction"]["find_by_payment_hash"]
+        except Exception as exc:
+            logger.warning(f"AmbossWallet payment status error: {exc}")
+            return PaymentPendingStatus()
+        return self._map_tx_status(tx)
+
+    def _map_tx_status(self, tx: dict | None) -> PaymentStatus:
+        if not tx:
+            return PaymentPendingStatus()
         status = tx.get("status")
         if status == "COMPLETED":
             fee = tx.get("fee")
