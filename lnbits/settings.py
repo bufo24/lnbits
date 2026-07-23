@@ -1168,6 +1168,7 @@ class SuperUserSettings(LNbitsSettings):
     lnbits_allowed_funding_sources: list[str] = Field(
         default=[
             "AlbyWallet",
+            "AmbossWallet",
             "BarkWallet",
             "BoltzWallet",
             "BlinkWallet",
