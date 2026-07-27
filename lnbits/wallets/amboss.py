@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import json
 import ssl
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -178,6 +179,8 @@ class AmbossWallet(Wallet):
         self.wallet_id = settings.amboss_wallet_id
         self.team_password = settings.amboss_team_password
         self.endpoint = settings.amboss_api_endpoint
+        self.sandbox = settings.amboss_sandbox
+        self.sandbox_auto_complete = settings.amboss_sandbox_auto_complete
         # Static per wallet: (team_id, is_sandbox, node, macaroon_hex). Cached so
         # repeat sends skip the ~3s GetSendContext + Argon2 + node-permissions
         # decrypt. ponytail: reset requires a restart if the node/macaroon rotates.
@@ -240,6 +243,9 @@ class AmbossWallet(Wallet):
             _input["description"] = memo
         if kwargs.get("expiry"):
             _input["expires_in_seconds"] = int(kwargs["expiry"])
+        if self.sandbox and self.sandbox_auto_complete:
+            # rails only acts on this for SANDBOX wallets; harmless otherwise.
+            _input["metadata"] = json.dumps({"amb_sandbox_behavior": "complete"})
 
         try:
             data = await self._gql(_CREATE_RECEIVE, {"input": _input})
