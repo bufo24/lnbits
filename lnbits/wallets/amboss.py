@@ -156,7 +156,9 @@ query($id: String!, $password_hash: String) {
 _FIND_BY_PAYMENT_HASH = f"""
 query($hash: String!) {{
   payment {{
-    transaction {{ find_one(payment_hash: $hash) {{ {_TX_FIELDS} }} }}
+    transaction {{
+      find_one(lightning: {{ payment_hash: $hash }}) {{ {_TX_FIELDS} }}
+    }}
   }}
 }}"""
 
