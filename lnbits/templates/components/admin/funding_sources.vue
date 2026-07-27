@@ -48,7 +48,7 @@
               v-model="formData[key]"
               filled
               class="q-mt-sm"
-              :type="hideInput ? 'password' : 'text'"
+              :type="prop.text ? 'text' : (hideInput ? 'password' : 'text')"
               :label="prop.label"
               :hint="prop.hint"
               :value="prop.value"
@@ -106,7 +106,7 @@
                 v-model="formData[key]"
                 filled
                 class="q-mt-sm"
-                :type="hideInput ? 'password' : 'text'"
+                :type="prop.text ? 'text' : (hideInput ? 'password' : 'text')"
                 :label="prop.label"
                 :hint="prop.hint"
                 :readonly="prop.readonly || false"
