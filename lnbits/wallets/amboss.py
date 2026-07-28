@@ -238,9 +238,21 @@ class AmbossWallet(Wallet):
         unhashed_description: bytes | None = None,
         **kwargs,
     ) -> InvoiceResponse:
-        # Amboss exposes only a plain `description` — no description_hash support.
         _input: dict[str, Any] = {"wallet_id": self.wallet_id, "amount": str(amount)}
-        if memo:
+        # BOLT11 allows only one of the 'd'/'h' tags: prefer description_hash
+        # (LNURL-pay/LUD-06 requires it to equal sha256(metadata)) and drop
+        # memo rather than send both, matching how the Amboss backend itself
+        # treats these two fields.
+        hash_hex = (
+            description_hash.hex()
+            if description_hash
+            else hashlib.sha256(unhashed_description).hexdigest()
+            if unhashed_description
+            else None
+        )
+        if hash_hex:
+            _input["description_hash"] = hash_hex
+        elif memo:
             _input["description"] = memo
         if kwargs.get("expiry"):
             _input["expires_in_seconds"] = int(kwargs["expiry"])
